@@ -58,7 +58,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # --- Local imports (your existing code) --------------------------------------
 from dataset import FibreDataset, collate_fn, get_val_transforms
 from model import build_model, count_parameters
-from evaluate import evaluate_coco, compute_coverage_metric
+from evaluate import evaluate_coco, compute_coverage_metric, compute_iou_metrics
 
 
 # ================================================================================
@@ -120,17 +120,35 @@ def benchmark_maskrcnn(args):
 
     result = {
         "architecture": "Mask R-CNN (R50-FPN-V2)",
-        "AP_mask":       round(metrics.get("AP_mask", 0.0), 4),
-        "AP50_mask":     round(metrics.get("AP50_mask", 0.0), 4),
-        "coverage_pct":  coverage_pct,
-        "inference_ms":  round(inference_ms, 1),
-        "parameters":    total_params,
-        "params_M":      round(total_params / 1e6, 1),
-        "info":          epoch_info.strip(),
+        "AP_mask": round(metrics.get("AP_mask", 0.0), 4),
+        "AP50_mask": round(metrics.get("AP50_mask", 0.0), 4),
+        "coverage_pct": coverage_pct,
+
+        "iou_mean": round(metrics.get("iou_mean", 0.0), 4),
+        "iou_median": round(metrics.get("iou_median", 0.0), 4),
+        "iou_p5": round(metrics.get("iou_p5", 0.0), 4),
+        "iou_p95": round(metrics.get("iou_p95", 0.0), 4),
+        "iou50_pct": round(metrics.get("iou50_fraction", 0.0) * 100, 1),
+        "iou75_pct": round(metrics.get("iou75_fraction", 0.0) * 100, 1),
+
+        "inference_ms": round(inference_ms, 1),
+        "parameters": total_params,
+        "params_M": round(total_params / 1e6, 1),
+        "info": epoch_info.strip(),
     }
-    print(f"\n  -> AP_mask={result['AP_mask']:.4f}  AP50={result['AP50_mask']:.4f}"
-          f"  Coverage>=95%={result['coverage_pct']}%"
-          f"  Inference={result['inference_ms']:.1f}ms  Params={result['params_M']}M")
+    print(
+        f"\n  -> AP_mask={result['AP_mask']:.4f}"
+        f"  AP50={result['AP50_mask']:.4f}"
+        f"  Coverage>=95%={result['coverage_pct']}%"
+        f"  IoU_mean={result['iou_mean']:.4f}"
+        f"  IoU_median={result['iou_median']:.4f}"
+        f"  IoU_p5={result['iou_p5']:.4f}"
+        f"  IoU_p95={result['iou_p95']:.4f}"
+        f"  IoU>=50%={result['iou50_pct']}%"
+        f"  IoU>=75%={result['iou75_pct']}%"
+        f"  Inference={result['inference_ms']:.1f}ms"
+        f"  Params={result['params_M']}M"
+    )
     return result
 
 
@@ -180,11 +198,24 @@ def benchmark_yolov8(args):
 
         print("  Computing coverage metric...")
         cov = evaluate_yolov8_coverage(model, args.data_dir, args.image_size)
+
         coverage_pct = round(cov["fraction_passing"] * 100, 1)
+        iou_mean = round(cov.get("mean_iou", 0.0), 4)
+        iou_median = round(cov.get("median_iou", 0.0), 4)
+        iou_p5 = round(cov.get("p5_iou", 0.0), 4)
+        iou_p95 = round(cov.get("p95_iou", 0.0), 4)
+        iou50_pct = round(cov.get("fraction_iou_passing_at_0.50", 0.0) * 100, 1)
+        iou75_pct = round(cov.get("fraction_iou_passing_at_0.75", 0.0) * 100, 1)
     else:
         ap_mask = ap50_mask = 0.0
         coverage_pct = 0.0
-        print("  Skipping AP/coverage evaluation (no fine-tuned checkpoint).")
+        iou_mean = 0.0
+        iou_median = 0.0
+        iou_p5 = 0.0
+        iou_p95 = 0.0
+        iou50_pct = 0.0
+        iou75_pct = 0.0
+        print("  Skipping AP/coverage/IoU evaluation (no fine-tuned checkpoint).")
 
     # -- Inference timing --
     print("  Measuring inference time...")
@@ -201,6 +232,12 @@ def benchmark_yolov8(args):
         "inference_ms":  round(inference_ms, 1),
         "parameters":    total_params,
         "params_M":      round(total_params / 1e6, 1),
+        "iou_mean": iou_mean,
+        "iou_median": iou_median,
+        "iou_p5": iou_p5,
+        "iou_p95": iou_p95,
+        "iou50_pct": iou50_pct,
+        "iou75_pct": iou75_pct,
     }
     print(f"\n  -> AP_mask={result['AP_mask']:.4f}  AP50={result['AP50_mask']:.4f}"
           f"  Coverage>=95%={result['coverage_pct']}%"
@@ -335,7 +372,21 @@ def evaluate_yolov8_coverage(model, data_dir, image_size, coverage_threshold=0.9
                     "segmentation": rle, "score": float(scores[j]),
                 })
 
-    return compute_coverage_metric(gt_annotations, pred_annotations, coverage_threshold)
+    coverage_metrics = compute_coverage_metric(
+        gt_annotations,
+        pred_annotations,
+        coverage_threshold,
+    )
+
+    iou_metrics = compute_iou_metrics(
+        gt_annotations,
+        pred_annotations,
+    )
+
+    return {
+        **coverage_metrics,
+        **iou_metrics,
+    }
 
 
 # ================================================================================
@@ -610,14 +661,17 @@ def format_results_table(results):
     print("  Table 21: Architecture Comparison on Fibre Segmentation")
     print("=" * 90)
     header = (f"{'Architecture':<30} {'AP_mask':>10} {'AP50_mask':>10}"
-              f" {'Cov>=95%':>9} {'Infer (ms)':>12} {'Parameters':>12}")
+              f" {'Cov>=95%':>9} {'IoU_med':>9} {'IoU75%':>8}"
+              f" {'Infer (ms)':>12} {'Parameters':>12}")
     print(header)
     print("-" * 90)
     for r in results:
         params_str = f"{r['params_M']}M"
         cov_str    = f"{r.get('coverage_pct', 0.0):.1f}%"
         print(f"  {r['architecture']:<28} {r['AP_mask']:>10.4f} {r['AP50_mask']:>10.4f}"
-              f" {cov_str:>9} {r['inference_ms']:>12.1f} {params_str:>12}")
+              f" {cov_str:>9} {r.get('iou_median', 0.0):>9.4f}"
+              f" {r.get('iou75_pct', 0.0):>7.1f}%"
+              f" {r['inference_ms']:>12.1f} {params_str:>12}")
     print("=" * 90)
 
 
@@ -653,7 +707,16 @@ def save_csv(results, path):
     """Save results as CSV."""
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "architecture", "AP_mask", "AP50_mask", "coverage_pct", "inference_ms", "parameters", "params_M",
+            "architecture",
+            "AP_mask",
+            "AP50_mask",
+            "coverage_pct",
+            "IoU_mean",
+            "IoU_median",
+            "IoU75_pct",
+            "inference_ms",
+            "parameters",
+            "params_M",
         ])
         writer.writeheader()
         for r in results:
